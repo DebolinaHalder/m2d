@@ -46,23 +46,23 @@ class topk_crossEntropy(nn.Module):
 
 class Feature_generator(nn.Module):
 
-    def __init__(self, nfeat,x,g,rep, args):
+    def __init__(self, nfeat,x,adj,rep, args):
         super(Feature_generator,self).__init__()
 
         nhid = args.num_hidden
         dropout = args.dropout
         self.temperature = args.temperature
         self.x_t = x
-        self.g_t = g
+        self.adj_t = adj
         X_norm = F.normalize(x[:,:x.shape[1] - args.new_features], p=2, dim=1)
         self.initial_sim = X_norm @ X_norm.T
         #self.initial_sim = self.initial_sim/(self.initial_sim.sum(dim=1, keepdim=True) + 1e-8)
-        self.weights = torch.ones(g.num_edges(), device=g.device)
+        
         self.num_steps = args.num_steps
         self.GNN = get_model(nfeat,args)
         self.classifier = nn.Linear(nhid,args.num_classes)
         #self.adv = nn.Linear(nhid,args.new_features)
-        self.adv = MLPX(nhid,args.hidden,args.new_features)
+        self.adv = MLPX(nhid,args.hidden,nfeat)
         self.rep = rep
         self.threshold = torch.zeros(1)
         self.dist_criterion = nn.KLDivLoss(reduction = 'batchmean')
@@ -84,8 +84,11 @@ class Feature_generator(nn.Module):
         self.A_loss = 0
         self.dist_loss = 0
         self.cls_loss = 0
-        #self.adj = MLPA(in_feats = args.hidden, dim_h = args.num_hidden, dim_z =nfeat)
-        self.adj = SymmetricEdgePredictor(in_dim = args.num_hidden, hidden_dim = args.hidden)
+        self.full_graph = None
+        self.full_src = None
+        self.full_dst = None
+        self.adj = MLPA(in_feats = args.hidden, dim_h = args.num_hidden, dim_z =nfeat)
+        #self.adj = SymmetricEdgePredictor(in_dim = args.num_hidden, hidden_dim = args.hidden)
         #self.adj = PersonaAttention(args.hidden,args.num_hidden)
         self.adj_params = list(self.adj.parameters())
         self.optimizer_adj = torch.optim.Adam(self.adj_params, lr = args.lr3)
@@ -95,12 +98,31 @@ class Feature_generator(nn.Module):
         
         self.optimizer_G = torch.optim.Adam(G_params,lr=args.lr, weight_decay = args.weight_decay)
 
+
+    def build_full_graph(self, num_nodes, device):
+        src, dst = torch.meshgrid(
+            torch.arange(num_nodes, device=device),
+            torch.arange(num_nodes, device=device),
+            indexing="ij",
+        )
+
+        mask = src != dst
+
+        self.full_src = src[mask]
+        self.full_dst = dst[mask]
+
+        self.full_graph = dgl.graph(
+            (self.full_src, self.full_dst),
+            num_nodes=num_nodes,
+            device=device,
+        )
+
     def forward(self,g,x):
         
-        rep = self.GNN(self.g_t,self.x_t,self.weights)
+        rep = self.GNN(self.adj_t,self.x_t)
         y = self.classifier(rep)
         #y = torch.sigmoid(y)
-        return y, self.weights
+        return y, self.adj_t, rep
     
     def normalize_adj(self,adj,epsilon = 0):
         
@@ -182,6 +204,9 @@ class Feature_generator(nn.Module):
         div_loss = self.args.alpha * ((K ** 2) * mask).mean()
         return div_loss
 
+    def get_MSE_loss(self,x,x_new):
+        return (((x - x_new) ** 2).sum()).sqrt()
+
     def optimize(self,g,ini_adj,x,labels,idx_train,end_epoch,epoch,teacher_output,teacher_rep):
         self.train()
 
@@ -190,38 +215,42 @@ class Feature_generator(nn.Module):
     ##################################################
 
         with torch.no_grad():
-            rep_prev = self.GNN(self.g_t, self.x_t, self.weights)
+            rep_prev = self.GNN(self.adj_t, self.x_t)
 
         
         # ---- Feature generator ----
-        f0 = self.adv(rep_prev)
+        
 
         # ---- Graph generator ----
-        adj_logits = self.adj(rep_prev)
+        if self.args.graph_skip_conn:
+            adj_logits = self.adj(rep_prev)
 
-        S = (1 - self.args.graph_beta) * adj_logits + \
-            self.args.graph_beta * self.initial_sim
+            S = (1 - self.args.graph_beta) * adj_logits + \
+                self.args.graph_beta * self.initial_sim
 
-        adj = (1 - self.args.graph_skip_conn) * ini_adj + \
-            self.args.graph_skip_conn * S
+            adj = (1 - self.args.graph_skip_conn) * ini_adj + \
+                self.args.graph_skip_conn * S
 
-        adj = adj * (1 - torch.eye(adj.size(0), device=adj.device))
-        adj = torch.relu(adj)
+            adj = adj * (1 - torch.eye(adj.size(0), device=adj.device))
+            adj_t = torch.relu(adj)
 
-        # ---- Sparse graph ----
-        src, dst = torch.nonzero(adj, as_tuple=True)
-        weights = adj[src, dst]
-
-        g_t = dgl.graph((src, dst), num_nodes=adj.size(0))
-        g_t.edata['feat'] = weights
+        else:
+            adj_t = self.adj_t
+            
 
         # ---- Node features ----
         if self.args.new_features:
+            f0 = self.adv(rep_prev)
+            #mask = pyro.distributions.RelaxedBernoulliStraightThrough(temperature=self.temperature, probs=f0).rsample()
+            x_t = x * f0
+            '''
             x_t = torch.cat(
-                [x[:, :-self.args.new_features],
-                f0.reshape(-1, self.args.new_features)],
-                dim=1
-            )
+                            [x[:, :-self.args.new_features],
+                            f0.reshape(-1, self.args.new_features)],
+                            dim=1
+                        )
+            '''
+            
         else:
             x_t = x
 
@@ -239,7 +268,7 @@ class Feature_generator(nn.Module):
 
         for _ in range(k_inner):
 
-            rep_t = self.GNN(g_t, x_t.detach(), weights.detach())
+            rep_t = self.GNN(adj_t.detach(), x_t.detach())
             logits = self.classifier(rep_t)
 
             self.cls_loss = self.criterion(
@@ -255,93 +284,69 @@ class Feature_generator(nn.Module):
         # ========== (3) OUTER LOOP (graph update) =======
         ##################################################
 
-        # Freeze GNN
-        for p in self.GNN.parameters():
-            p.requires_grad = False
-        for p in self.classifier.parameters():
-            p.requires_grad = False
+        
+        for p in self.adj.parameters():
+            p.requires_grad = True
+        for p in self.adv.parameters():
+            p.requires_grad = True
 
         # Recompute with gradients for adj/adv
-        rep = self.GNN(self.g_t, self.x_t, self.weights).detach()
-
-        f0 = self.adv(rep)
-        adj_logits = self.adj(rep)
-
-        S = (1 - self.args.graph_beta) * adj_logits + \
-            self.args.graph_beta * self.initial_sim
-
-        adj = (1 - self.args.graph_skip_conn) * ini_adj + \
-            self.args.graph_skip_conn * S
-
-        adj = adj * (1 - torch.eye(adj.size(0), device=adj.device))
-        adj = torch.relu(adj)
+        rep = self.GNN(self.adj_t, self.x_t).detach()
 
         
-        ##################################################
-        # (3) EMA smoothing (FIXED + SIMPLE)
-        ##################################################
-        ema_decay = getattr(self.args, "ema_decay", 0.9)
+        if self.args.graph_skip_conn:
+            adj_logits = self.adj(rep)
 
-        adj_detached = adj.detach()
+            S = (1 - self.args.graph_beta) * adj_logits + \
+                self.args.graph_beta * self.initial_sim
 
-        if not hasattr(self, "adj_ema"):
-            self.adj_ema = adj_detached.clone()
+            adj = (1 - self.args.graph_skip_conn) * ini_adj + \
+                self.args.graph_skip_conn * S
+
+            adj = adj * (1 - torch.eye(adj.size(0), device=adj.device))
+            adj_t = torch.relu(adj)
+
         else:
-            self.adj_ema = ema_decay * self.adj_ema + (1 - ema_decay) * adj_detached
-
-        adj = self.adj_ema
-
-        ##################################################
-        # (4) OPTIONAL: Light pruning (NOT top-k)
-        ##################################################
-        # Keep graph dense but remove tiny noise
-        threshold = getattr(self.args, "edge_threshold", 0.2)
-        mask = adj > threshold
-
-        src, dst = torch.nonzero(adj, as_tuple=True)
-        weights = adj[src, dst]
-
-        g_t = dgl.graph((src, dst), num_nodes=adj.size(0))
-        g_t.edata['feat'] = weights
+            adj_t = self.adj_t
 
         if self.args.new_features:
-            x_t = torch.cat(
-                [x[:, :-self.args.new_features],
-                f0.reshape(-1, self.args.new_features)],
-                dim=1
-            )
+            f0 = self.adv(rep)
+            #mask = pyro.distributions.RelaxedBernoulliStraightThrough(temperature=self.temperature, probs=f0).rsample()
+            x_t = x * f0
         else:
             x_t = x
 
         # Forward through frozen GNN
-        rep_t = self.GNN(g_t, x_t, weights)
+        rep_t = self.GNN(adj_t, x_t)
         logits = self.classifier(rep_t)
 
         ##################################################
         # ========== (4) LOSSES ==========================
         ##################################################
 
-        cls_loss = self.criterion(
-            logits[idx_train],
-            labels[idx_train]
-        )
-
         self.dist_loss = self.dist_criterion(
             F.log_softmax(logits[idx_train] / self.args.temperature, dim=1),
             F.softmax(teacher_output[idx_train] / self.args.temperature, dim=1),
         ) * (self.args.temperature ** 2)
 
-        div_loss = self.args.alpha * self.get_div_loss(x_t)
-
-        adj_loss = self.lpp_trace_loss(
-            rep_t,
-            adj_logits
-        )
+        if self.args.graph_skip_conn:
+            adj_loss = self.lpp_trace_loss(
+                rep_t,
+                adj_t
+            )
+        else:
+            adj_loss = 0
+        if self.args.new_features:
+            self.div_loss = self.get_MSE_loss(
+                x_t,
+                x
+            )
+        else:
+            self.div_loss = 0
 
         total_loss = (
-            (1 - self.args.dist_alpha) * cls_loss +
-            self.args.dist_alpha * self.dist_loss +
-            div_loss +
+            self.dist_loss +
+            self.args.alpha * self.div_loss +
             adj_loss
         )
 
@@ -359,6 +364,8 @@ class Feature_generator(nn.Module):
 
         self.optimizer_A.step()
         self.optimizer_adj.step()
+        self.my_lr_scheduler.step(total_loss)
+        self.my_lr_scheduler2.step(total_loss)
 
         ##################################################
         # ========== (6) UNFREEZE ========================
@@ -377,9 +384,13 @@ class Feature_generator(nn.Module):
         # ========== (7) STORE STATE =====================
         ##################################################
 
-        self.g_t = g_t
+        self.adj_t = adj_t.detach()
         self.x_t = x_t.detach()
-        self.weights = weights.detach()
+        if self.args.new_features:
+            self.m_t = f0.detach()
+        if self.args.graph_skip_conn:
+            self.w_t = adj_logits.detach()
+        
         
         
         

@@ -20,7 +20,9 @@ class MLPX(torch.nn.Module):
     
     def projection(self, z):
         z = torch.relu((self.fc1(z)))
-        return (self.norm2(self.fc2(z)))
+        #return (self.norm2(self.fc2(z)))
+        return ((self.fc2(z)))
 
     def forward(self, h):
-        return self.projection(h)
+        #return (self.projection(h))
+        return torch.sigmoid(self.projection(h))
